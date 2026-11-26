@@ -1,0 +1,34 @@
+name: Build Windows client DLL
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: xmake-io/github-action-setup-xmake@v1
+      - uses: actions/cache@v6
+        with:
+          path: ~/AppData/Local/.xmake
+          key: inspector-client-xmake-${{ hashFiles('xmake.lua') }}
+          restore-keys: inspector-client-xmake-
+      - uses: ZhongRuoyu/setup-llvm@v0
+        with:
+          llvm-version: 22
+      - run: xmake repo -u
+      - run: xmake f -p windows -a x64 -m release -y
+      - run: xmake -v -y
+      - name: Verify install files
+        shell: pwsh
+        run: |
+          if (!(Test-Path 'bin/BEItemTransformInspector/BEItemTransformInspector.dll')) { throw 'Missing DLL' }
+          if (!(Test-Path 'bin/BEItemTransformInspector/manifest.json')) { throw 'Missing manifest' }
+      - uses: actions/upload-artifact@v7
+        with:
+          name: BEItemTransformInspector-Windows-client
+          path: bin/BEItemTransformInspector/
+          if-no-files-found: error
