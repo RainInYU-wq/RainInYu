@@ -125,13 +125,13 @@ static void observe(ItemStack const& item, Context ctx) {
 
 // These three signatures are from the v26.60.9 CLIENT headers.
 // All hooks call the unmodified original exactly once, even if logging fails.
-LL_TYPE_INSTANCE_HOOK(FirstPersonContext, ItemInHandRenderer, ll::memory::HookPriority::Normal,
+LL_TYPE_INSTANCE_HOOK(FirstPersonContext, ll::memory::HookPriority::Normal, ItemInHandRenderer,
     &ItemInHandRenderer::renderFirstPerson, void,
     BaseActorRenderContext& context, Matrix const& prevProj, ItemContextFlags flags) {
     Scope s({static_cast<int>(flags) | 1, -1, "renderFirstPerson"});
     origin(context, prevProj, flags);
 }
-LL_TYPE_INSTANCE_HOOK(ItemContext, ItemInHandRenderer, ll::memory::HookPriority::Normal,
+LL_TYPE_INSTANCE_HOOK(ItemContext, ll::memory::HookPriority::Normal, ItemInHandRenderer,
     &ItemInHandRenderer::renderItem, void,
     BaseActorRenderContext& context, Actor& entity, ItemStack const& item, bool fromJson,
     ItemContextFlags flags, bool useMatrixAsIs, bool renderingMainHand) {
@@ -139,7 +139,7 @@ LL_TYPE_INSTANCE_HOOK(ItemContext, ItemInHandRenderer, ll::memory::HookPriority:
     try { observe(item, current); } catch (...) { /* diagnostic only */ }
     origin(context, entity, item, fromJson, flags, useMatrixAsIs, renderingMainHand);
 }
-LL_TYPE_INSTANCE_HOOK(DefaultTransform, ItemInHandRenderer, ll::memory::HookPriority::Normal,
+LL_TYPE_INSTANCE_HOOK(DefaultTransform, ll::memory::HookPriority::Normal, ItemInHandRenderer,
     &ItemInHandRenderer::_applyDefaultItemTransforms, void,
     MatrixStack::MatrixStackRef& worldMatrix, ItemStack const& item, bool isInHandItem,
     BlockType const* blockType, BlockShape blockShape, ItemRenderCall const* renderObjectCall,
@@ -180,7 +180,7 @@ public:
                 output.imbue(std::locale::classic());
                 output << std::setprecision(9);
                 started = Clock::now(); samples.clear(); observed.clear(); total=0; limitReported=false;
-                output << "\n=== BE Item Transform Inspector 0.1.2 | SDK 26.60.9 | new session ===\n"
+                output << "\n=== BE Item Transform Inspector 0.1.2-hotfix1 | SDK 26.60.9 | new session ===\n"
                        << "All item IDs accepted; held default-transform probe only, not a full hand-bone or mesh capture.\n"
                        << "flags: first=1 world=2 UI=4 item2d=8 item3d=16 inhand=32 glint=64 tint=128; -1 unknown\n"
                        << "Both matrix multiplication hypotheses are logged. No Euler angles inferred.\n"
