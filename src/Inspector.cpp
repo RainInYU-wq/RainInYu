@@ -12,6 +12,14 @@
 #include "mc/client/model/geom/Cube.h"
 #include "mc/client/model/geom/PolygonQuad.h"
 #include "mc/client/renderer/Tessellator.h"
+#include "mc/client/renderer/texture/TextureTessellator.h"
+#include "mc/deps/minecraft_renderer/renderer/Mesh.h"
+#include "mc/deps/minecraft_renderer/renderer/MeshContext.h"
+#include "mc/deps/minecraft_renderer/resources/ClientTexture.h"
+#include "mc/deps/minecraft_renderer/resources/ServerTexture.h"
+#include <atomic>
+#include <algorithm>
+#include <variant>
 #include "mc/deps/minecraft_renderer/game/ItemRenderCall.h"
 #include "mc/deps/minecraft_renderer/resources/MERSUniformData.h"
 #include "mc/world/actor/RenderParams.h"
@@ -56,6 +64,26 @@ struct Context { int flags = -1; int mainHand = -1; const char* source = "unknow
 static thread_local Context current;
 static thread_local std::string_view currentItem;
 static thread_local int attachDepth = 0;
+static std::atomic_uint64_t drawSequence{0};
+static thread_local uint64_t nativeDrawId=0;
+static thread_local std::uintptr_t nativeCallId=0;
+struct EntryCamera { std::optional<Mat> world,view,projection; };
+static thread_local EntryCamera nativeEntryCamera;
+static thread_local unsigned meshDrawDepth=0;
+static bool captureUnscoped=false;
+struct NativeDrawScope {
+    uint64_t old; std::uintptr_t oldCall; EntryCamera oldCamera;
+    explicit NativeDrawScope(std::uintptr_t call):old(nativeDrawId),oldCall(nativeCallId),oldCamera(nativeEntryCamera) {
+        nativeDrawId=++drawSequence; nativeCallId=call; nativeEntryCamera={};
+    }
+    void capture(mce::Camera const& cam){
+        if(!cam.worldMatrixStack->stack->empty()) nativeEntryCamera.world=cam.worldMatrixStack->top()._m.get();
+        if(!cam.viewMatrixStack->stack->empty()) nativeEntryCamera.view=cam.viewMatrixStack->top()._m.get();
+        if(!cam.projectionMatrixStack->stack->empty()) nativeEntryCamera.projection=cam.projectionMatrixStack->top()._m.get();
+    }
+    ~NativeDrawScope(){nativeDrawId=old;nativeCallId=oldCall;nativeEntryCamera=oldCamera;}
+};
+struct MeshDrawScope { MeshDrawScope(){++meshDrawDepth;} ~MeshDrawScope(){--meshDrawDepth;} };
 struct ItemScope {
     std::string_view previous;
     explicit ItemScope(std::string_view name) noexcept : previous(currentItem) { currentItem = name; }
@@ -214,12 +242,17 @@ static const char* screenView(ScreenContext const& sc) {
     return sc.isDrawingFirstPersonObjects || (current.flags >= 0 && (current.flags & 1))
         ? "FIRST_PERSON_CANDIDATE" : "WORLD_CANDIDATE";
 }
-static void dumpCamera(std::ostream& out, ScreenContext const& sc) {
-    auto const& cam = sc.camera;
+static void dumpCameraRaw(std::ostream& out, mce::Camera const& cam) {
     if (!cam.worldMatrixStack->stack->empty()) printMatrix(out,"CAMERA_WORLD_STACK_TOP",cam.worldMatrixStack->top()._m.get());
     if (!cam.viewMatrixStack->stack->empty()) printMatrix(out,"CAMERA_VIEW_STACK_TOP",cam.viewMatrixStack->top()._m.get());
-    // Projection is intentionally excluded; common pre-projection space still needs verification.
+    if (!cam.worldMatrixStack->stack->empty() && !cam.viewMatrixStack->stack->empty()) {
+        auto w=cam.worldMatrixStack->top()._m.get(); auto v=cam.viewMatrixStack->top()._m.get();
+        printMatrix(out,"CANDIDATE_VIEW_TIMES_WORLD",v*w);
+    }
+    // Projection is separate diagnostic evidence, NEVER a calibration input.
+    if (!cam.projectionMatrixStack->stack->empty()) printMatrix(out,"PROJECTION_DIAGNOSTIC_ONLY",cam.projectionMatrixStack->top()._m.get());
 }
+static void dumpCamera(std::ostream& out, ScreenContext const& sc) { dumpCameraRaw(out,sc.camera); }
 static void stageHeader(std::ostream& out, const char* stage, std::string_view name, ScreenContext const& sc) {
     out << "\nSTAGE " << stage << " item=" << name << " view=" << screenView(sc)
         << " flags=" << current.flags << " attach_depth=" << attachDepth
@@ -238,12 +271,17 @@ static void cameraStage(const char* label, std::string_view name, ScreenContext 
 LL_TYPE_INSTANCE_HOOK(NativeDraw, ll::memory::HookPriority::Normal, ItemInHandRenderer,
     &ItemInHandRenderer::renderObject, void,
     BaseActorRenderContext& ctx, ItemRenderCall const& call, dragon::RenderMetadata const& metadata, ItemContextFlags flags) {
-    if (active.load(std::memory_order_relaxed) && stageTarget(currentItem)) {
+    bool target=active.load(std::memory_order_relaxed) && stageTarget(currentItem);
+    // ID survives only the synchronous original renderObject call.
+    std::optional<NativeDrawScope> drawScope;
+    if(target) drawScope.emplace(reinterpret_cast<std::uintptr_t>(&call));
+    if (target) {
         try {
             auto const& sc=ctx.mScreenContext;
-            if (!sc.isDrawingUI && reserveStage(stageKey("NATIVE_RENDER_OBJECT_ENTRY",currentItem,sc))) {
+            drawScope->capture(sc.camera);
+            if (!sc.isDrawingUI && reserveStage(stageKey("NATIVE_RENDER_OBJECT_ENTRY",currentItem,sc),120,100)) {
                 std::ostringstream out; initStream(out); stageHeader(out,"NATIVE_RENDER_OBJECT_ENTRY",currentItem,sc);
-                out << "call_session_address=" << reinterpret_cast<std::uintptr_t>(&call) << " object_flags=" << static_cast<int>(flags) << '\n';
+                out << "draw_id=" << nativeDrawId << " call_session_address=" << reinterpret_cast<std::uintptr_t>(&call) << " object_flags=" << static_cast<int>(flags) << '\n';
                 dumpCamera(out,sc); out << "END_STAGE\n"; writeStage(out.str());
             }
         } catch (...) {}
@@ -281,9 +319,10 @@ LL_TYPE_INSTANCE_HOOK(NativeMeshBuild, ll::memory::HookPriority::Normal, ItemInH
     BaseActorRenderContext& ctx, ItemStack const& item, int frame) {
     std::string name;
     bool capture=false;
-    if (active.load(std::memory_order_relaxed) && vertexHookInstalled && !vertexBuffer) {
-        try { name=targetName(item); capture=!name.empty() && want(name) && reserveStage("MESH_ATTEMPT:"+name,48,500); } catch (...) {}
+    if (active.load(std::memory_order_relaxed)) {
+        try { name=targetName(item); capture=vertexHookInstalled && !vertexBuffer && !name.empty() && want(name) && reserveStage("MESH_ATTEMPT:"+name,48,500); } catch (...) {}
     }
+    ItemScope buildItem(name.empty() ? currentItem : std::string_view(name));
     std::vector<VertexSample> vertices;
     if (capture) { try { vertices.reserve(8192); } catch (...) { capture=false; } }
     VertexScope scope(capture ? &vertices : vertexBuffer);
@@ -375,8 +414,176 @@ LL_TYPE_INSTANCE_HOOK(AttachDraw, ll::memory::HookPriority::Normal, SkinnedMesh,
     origin(sc,metadata,controller,layer,materials,textures,sorted,previous,mers,shadow,dithering);
 }
 
+
+// MeshData is CPU-side data exposed by SDK 26.60.9. Never infer GPU layout from a pointer.
+// Positions/UV/normals/indices are copied while the original owns them; no retained references.
+static void dumpMeshData(std::ostream& out, mce::MeshData const& data, bool full) {
+    auto const& p=data.mPositions.get(); auto const& uv=data.mTextureUVs[0].get();
+    auto const& n=data.mNormals.get(); auto const& idx=data.mIndices.get();
+    out << "CPU_MESH mode=" << static_cast<int>(data.mMode) << " positions=" << p.size()
+        << " uv0=" << uv.size() << " normals=" << n.size() << " indices=" << idx.size() << '\n';
+    if (!full) return;
+    if(p.empty()){out << "CPU_POSITIONS_UNAVAILABLE\n";return;}
+    if(p.size()>16384 || idx.size()>65536){out << "CPU_MESH_OVER_LIMIT\n";return;}
+    out << "CPU_VERTEX_COLUMNS index x y z has_uv u v has_normal nx ny nz nw\n";
+    for(size_t i=0;i<p.size();++i){
+        out << "MV " << i << ' ' << p[i].x << ' ' << p[i].y << ' ' << p[i].z;
+        if(i<uv.size()) out << " 1 " << uv[i].x << ' ' << uv[i].y; else out << " 0 0 0";
+        if(i<n.size()) out << " 1 " << n[i].x << ' ' << n[i].y << ' ' << n[i].z << ' ' << n[i].w; else out << " 0 0 0 0 0";
+        out << '\n';
+    }
+    out << "CPU_INDICES";
+    for(auto i:idx) out << ' ' << i;
+    out << '\n';
+}
+static void dumpNativeMesh(std::ostream& out, mce::Mesh const& mesh, bool full) {
+    auto const& vc=mesh.mVertexCount.get(); auto const& raw=mesh.mRawData.get();
+    out << "MESH vertex_count=" << (vc ? std::to_string(*vc) : "unknown")
+        << " primitive=" << static_cast<int>(mesh.mPrimitiveMode) << " raw_bytes=" << raw.size() << '\n';
+    dumpMeshData(out,mesh.mMeshData.get(),full);
+    if(full && !raw.empty() && raw.size()<=262144){
+        static constexpr char hex[]="0123456789abcdef";
+        out << "RAW_MESH_HEX_UNDECODED ";
+        for(unsigned char b:raw) out << hex[b>>4] << hex[b&15];
+        out << '\n';
+    } else if(full && !raw.empty()) out << "RAW_MESH_OVER_LIMIT\n";
+}
+// Same draw scope and camera at lower CPU render submission, not a final shader readback.
+static void meshDrawRecord(char const* entry, mce::Mesh const& mesh, mce::MeshContext const& ctx,
+                           uint start, uint count, bool overridden) {
+    if(!active.load(std::memory_order_relaxed) || !stageTarget(currentItem) || attachDepth || ctx.isDrawingUI) return;
+    auto view=ctx.isDrawingFirstPersonObjects || (current.flags>=0 && (current.flags&1)) ? "FIRST_PERSON_CANDIDATE":"WORLD_CANDIDATE";
+    auto id=std::to_string(reinterpret_cast<std::uintptr_t>(&mesh));
+    auto key=std::string(entry)+":"+std::string(currentItem)+":"+view+":"+id;
+    if(!reserveStage(key,120,100)) return;
+    std::ostringstream out;initStream(out);
+    out << "\nSTAGE NATIVE_MESH_DRAW item=" << currentItem << " view=" << view
+        << " flags=" << current.flags << " elapsed_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now()-started).count()
+        << " draw_id=" << nativeDrawId << " call_session_address=" << nativeCallId << '\n';
+    out << "entry=" << entry << " mesh_session_id=" << id << " nested_mesh_depth=" << meshDrawDepth
+        << " exact_renderObject_scope=" << (nativeDrawId!=0) << " start=" << start << " count=" << count << " override_index_buffer=" << overridden << '\n';
+    if(nativeDrawId){
+        if(nativeEntryCamera.world) printMatrix(out,"SAME_DRAW_RENDEROBJECT_WORLD",*nativeEntryCamera.world);
+        if(nativeEntryCamera.view) printMatrix(out,"SAME_DRAW_RENDEROBJECT_VIEW",*nativeEntryCamera.view);
+        if(nativeEntryCamera.projection) printMatrix(out,"SAME_DRAW_RENDEROBJECT_PROJECTION_DIAGNOSTIC_ONLY",*nativeEntryCamera.projection);
+    }
+    dumpCameraRaw(out,ctx.camera);
+    // Capture payload a few times for each mesh; draw matrices remain sampled independently.
+    bool full=reserveStage("CPU_PAYLOAD:"+key,3,0);
+    dumpNativeMesh(out,mesh,full);
+    out << "END_STAGE\n";writeStage(out.str());
+}
+using DrawTexture=std::variant<std::monostate,mce::TexturePtr,mce::ClientTexture,mce::ServerTexture>;
+using DrawFn=void (mce::Mesh::*)(mce::MeshContext&,mce::MaterialPtr const&,DrawTexture const&,uint,uint,OffscreenCaptureDescription const&,mce::IndexBufferContainer const*) const;
+using DrawMetaFn=void (mce::Mesh::*)(mce::MeshContext&,dragon::RenderMetadata const&,mce::MaterialPtr const&,DrawTexture const&,uint,uint,OffscreenCaptureDescription const&,mce::IndexBufferContainer const*) const;
+using DrawSpanFn=void (mce::Mesh::*)(mce::MeshContext&,mce::MaterialPtr const&,gsl::span<mce::ClientTexture const*>,uint,uint,OffscreenCaptureDescription const&,mce::IndexBufferContainer const*) const;
+LL_TYPE_INSTANCE_HOOK(MeshDrawOne,ll::memory::HookPriority::Normal,mce::Mesh,
+    static_cast<DrawFn>(&mce::Mesh::renderMesh),void,
+    mce::MeshContext& ctx,mce::MaterialPtr const& mat,DrawTexture const& tex,uint start,uint count,
+    OffscreenCaptureDescription const& off,mce::IndexBufferContainer const* idx){
+    MeshDrawScope depth;
+    try{meshDrawRecord("renderMesh_single",*this,ctx,start,count,idx!=nullptr);}catch(...){}
+    origin(ctx,mat,tex,start,count,off,idx);
+}
+LL_TYPE_INSTANCE_HOOK(MeshDrawMeta,ll::memory::HookPriority::Normal,mce::Mesh,
+    static_cast<DrawMetaFn>(&mce::Mesh::renderMesh),void,
+    mce::MeshContext& ctx,dragon::RenderMetadata const& meta,mce::MaterialPtr const& mat,DrawTexture const& tex,uint start,uint count,
+    OffscreenCaptureDescription const& off,mce::IndexBufferContainer const* idx){
+    MeshDrawScope depth;
+    try{meshDrawRecord("renderMesh_metadata",*this,ctx,start,count,idx!=nullptr);}catch(...){}
+    origin(ctx,meta,mat,tex,start,count,off,idx);
+}
+LL_TYPE_INSTANCE_HOOK(MeshDrawSpan,ll::memory::HookPriority::Normal,mce::Mesh,
+    static_cast<DrawSpanFn>(&mce::Mesh::renderMesh),void,
+    mce::MeshContext& ctx,mce::MaterialPtr const& mat,gsl::span<mce::ClientTexture const*> tex,uint start,uint count,
+    OffscreenCaptureDescription const& off,mce::IndexBufferContainer const* idx){
+    MeshDrawScope depth;
+    try{meshDrawRecord("renderMesh_span",*this,ctx,start,count,idx!=nullptr);}catch(...){}
+    origin(ctx,mat,tex,start,count,off,idx);
+}
+
+// MCNAPI functions are not guaranteed to be exported by the SDK. Resolve exact MSVC
+// x64 symbols at runtime instead of linking them or guessing memory offsets.
+static constexpr ll::memory::SymbolView textureItemSymbol{"?_tessellateTextureItem@ItemInHandRenderer@@SAXAEAVBaseActorRenderContext@@AEAVTextureTessellator@@PEAVMob@@AEBVItemStack@@HAEAG4@Z"};
+static constexpr ll::memory::SymbolView textureTessSymbol{"?tessellate@TextureTessellator@@QEAAXAEAVTessellator@@QEBE11GGAEBUTessellationParameters@1@@Z"};
+static thread_local uint64_t textureBuildId=0;
+static std::atomic_uint64_t textureSequence{0};
+struct TextureBuildScope {
+    uint64_t prev;
+    TextureBuildScope(bool target):prev(textureBuildId){ textureBuildId=target ? ++textureSequence : 0; }
+    ~TextureBuildScope(){ textureBuildId=prev; }
+};
+LL_TYPE_STATIC_HOOK(TextureItemBuild,ll::memory::HookPriority::Normal,ItemInHandRenderer,
+    textureItemSymbol,void,BaseActorRenderContext& ctx,TextureTessellator& tess,Mob* mob,
+    ItemStack const& item,int fallbackFrame,ushort& heightOut,ushort& widthOut){
+    std::string name;
+    if(active.load(std::memory_order_relaxed)){try{name=targetName(item);}catch(...){}}
+    ItemScope scope(name); bool target=active.load(std::memory_order_relaxed) && stageTarget(currentItem);
+    TextureBuildScope build(target);
+    origin(ctx,tess,mob,item,fallbackFrame,heightOut,widthOut);
+    if(target){try{
+        if(reserveStage("TEXTURE_ITEM_BUILD:"+name,32,0)){
+            std::ostringstream out;initStream(out);stageHeader(out,"NATIVE_TEXTURE_ITEM_BUILD",name,ctx.mScreenContext);
+            out << "texture_build_id=" << textureBuildId << " draw_id=" << nativeDrawId << " fallback_frame=" << fallbackFrame
+                << " width_out=" << widthOut << " height_out=" << heightOut << '\n';
+            out << "END_STAGE\n";writeStage(out.str());
+        }
+    }catch(...){}}
+}
+LL_TYPE_INSTANCE_HOOK(TextureTessBuild,ll::memory::HookPriority::Normal,TextureTessellator,
+    textureTessSymbol,void,Tessellator& tess,uchar const* colorData,uchar const* mersData,uchar const* normalsData,
+    ushort width,ushort height,TextureTessellator::TessellationParameters const& params){
+    bool scoped=active.load(std::memory_order_relaxed) && stageTarget(currentItem) && !attachDepth;
+    bool unknown=active.load(std::memory_order_relaxed) && captureUnscoped && currentItem.empty() && width==16 && height==16 && !attachDepth;
+    bool take=false;size_t before=0;
+    try{if((scoped||unknown) && reserveStage(scoped?"TEXTURE_TESS_TARGET":"TEXTURE_TESS_UNATTRIBUTED",scoped?32:64,0)){
+        take=true;before=tess.mMeshData->mPositions->size();
+    }}catch(...){take=false;}
+    origin(tess,colorData,mersData,normalsData,width,height,params);
+    if(take){try{
+        std::ostringstream out;initStream(out);
+        out << "\nSTAGE NATIVE_TEXTURE_TESSELLATED item=" << (scoped?currentItem:std::string_view("UNATTRIBUTED"))
+            << " flags=" << current.flags << " texture_build_id=" << textureBuildId << " draw_id=" << nativeDrawId
+            << " elapsed_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now()-started).count() << '\n';
+        out << "width=" << width << " height=" << height << " before_positions=" << before
+            << " tess_session_id=" << reinterpret_cast<std::uintptr_t>(&tess) << '\n';
+        dumpMeshData(out,tess.mMeshData.get(),true);
+        out << "END_STAGE\n";writeStage(out.str());
+    }catch(...){}}
+}
+
+// A later-stage capture than Tessellator::vertex: full CPU mesh just before upload/return.
+// Only target-scoped calls by default; optional unknown candidates are explicitly UNATTRIBUTED.
+LL_TYPE_INSTANCE_HOOK(MeshEnd,ll::memory::HookPriority::Normal,Tessellator,
+    &Tessellator::end,mce::Mesh,Tessellator::UploadMode mode,std::string_view debugName,
+    SupplementaryFieldAutoGenerationMode supplementary){
+    bool scoped=active.load(std::memory_order_relaxed) && stageTarget(currentItem) && !attachDepth;
+    bool unknown=active.load(std::memory_order_relaxed) && captureUnscoped && currentItem.empty() && !attachDepth;
+    try{
+        if(scoped || unknown){
+            std::ostringstream out;
+            auto const& md=mMeshData.get();auto count=md.mPositions->size();
+            bool plausible=count>=4 && count<=4096 && md.mTextureUVs[0].get().size()==count;
+            if((scoped || plausible) && reserveStage(scoped?"TESS_END_TARGET":"TESS_END_UNATTRIBUTED",scoped?24:64,0)){
+                initStream(out);
+                out << "\nSTAGE NATIVE_TESS_END item=" << (scoped?currentItem:std::string_view("UNATTRIBUTED"))
+                    << " flags=" << current.flags << " texture_build_id=" << textureBuildId << " draw_id=" << nativeDrawId << " call_session_address=" << nativeCallId
+                    << " elapsed_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now()-started).count() << '\n';
+                out << "tess_session_id=" << reinterpret_cast<std::uintptr_t>(this) << " debug_name=" << debugName << " upload_mode=" << static_cast<int>(mode) << '\n';
+                dumpMeshData(out,md,true);
+                out << "END_STAGE\n";
+                writeStage(out.str());
+            }
+        }
+    }catch(...){}
+    // Return original result directly; never alter cache or tessellator state.
+    return origin(mode,debugName,supplementary);
+}
+
 class Inspector {
     ll::mod::NativeMod& self = *ll::mod::NativeMod::current();
+    bool textureItemHook=false,textureTessHook=false;
+    bool meshEndHook=false,meshOneHook=false,meshMetaHook=false,meshSpanHook=false;
     bool firstHook=false, itemHook=false, defaultHook=false, nativeDrawHook=false, meshBuildHook=false, attachEntryHook=false, attachInnerHook=false, attachDrawHook=false;
 public:
     static Inspector& instance() { static Inspector value; return value; }
@@ -387,9 +594,10 @@ public:
             std::filesystem::create_directories(dir);
             // Unique per process/session; never overwrite previous capture.
             auto stamp=std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
-            auto path=dir / ("ItemTransformDump_v020_"+std::to_string(stamp)+".txt");
-            for (unsigned i=1; std::filesystem::exists(path);++i) path=dir/("ItemTransformDump_v020_"+std::to_string(stamp)+"_"+std::to_string(i)+".txt");
+            auto path=dir / ("ItemTransformDump_v021_"+std::to_string(stamp)+".txt");
+            for (unsigned i=1; std::filesystem::exists(path);++i) path=dir/("ItemTransformDump_v021_"+std::to_string(stamp)+"_"+std::to_string(i)+".txt");
             captureTarget="minecraft:iron_pickaxe";
+            captureUnscoped=false; { std::ifstream cfg(dir/"capture_unscoped_meshes.txt"); int value; if(cfg>>value) captureUnscoped=value!=0; }
             { std::ifstream config(dir/"capture_target.txt"); std::string value; if (config>>value) captureTarget=value; }
             std::string label="unspecified";
             { std::ifstream config(dir/"capture_label.txt"); std::getline(config,label); if(label.empty()) label="unspecified"; }
@@ -399,13 +607,13 @@ public:
                 if (!output) { self.getLogger().error("Cannot open ItemTransformDump.txt"); return false; }
                 output.imbue(std::locale::classic());
                 output << std::setprecision(9);
-                started = Clock::now(); samples.clear(); observed.clear(); stages.clear(); total=0; stageTotal=0; limitReported=false;
-                output << "\n=== BE Item Transform Inspector 0.2.0-probe1 | SDK 26.60.9 | new session ===\n"
+                started = Clock::now(); drawSequence=0; textureSequence=0; samples.clear(); observed.clear(); stages.clear(); total=0; stageTotal=0; limitReported=false;
+                output << "\n=== BE Item Transform Inspector 0.2.1-meshprobe1 | SDK 26.60.9 | new session ===\n"
                        << "capture_label=" << label << " target=" << captureTarget << '\n'
-                       << "Raw stage observations only; no automatic landmark pairing or final common matrix asserted.\n"
+                       << "Raw stage observations only; CPU mesh is not shader input readback. Projection separate. No automatic landmark pairing or final common matrix asserted.\n"
                        << "flags: first=1 world=2 UI=4 item2d=8 item3d=16 inhand=32 glint=64 tint=128; -1 unknown\n"
                        << "Both matrix multiplication hypotheses are logged. No Euler angles inferred.\n"
-                       << "OBSERVED_RENDER_ITEM is entry-only, not a successful matrix sample. Limits: 24/key, 2048 default + 2048 stage reservations/session.\n" << std::flush;
+                       << "OBSERVED_RENDER_ITEM is entry-only, not a successful matrix sample. Limits: default 24/key; stage-specific caps; 2048 default + 2048 stage reservations/session.\n" << std::flush;
             }
             int a = FirstPersonContext::hook(); firstHook = a == 0;
             int b = ItemContext::hook(); itemHook = b == 0;
@@ -414,18 +622,28 @@ public:
             int e=AttachEntry::hook(); attachEntryHook=e==0;
             int f=AttachInner::hook(); attachInnerHook=f==0;
             int g=AttachDraw::hook(); attachDrawHook=g==0;
-            // BTG pass does not need to intercept the high-frequency tessellator.
-            bool captureVertices = label.rfind("BTG",0)!=0 && label.rfind("btg",0)!=0;
+            // The old high-frequency per-vertex hook is now optional; mesh-level probes are preferred.
+            bool captureVertices = false; // legacy per-vertex hook opt-in only
             { std::ifstream config(dir/"capture_vertices.txt"); int value; if(config>>value) captureVertices=value!=0; }
             int h=-999, j=-999;
-            if(captureVertices) { h=VertexInput::hook(); vertexHookInstalled=h==0;
-                if(vertexHookInstalled) { j=NativeMeshBuild::hook(); meshBuildHook=j==0; }
-            }
+            if(captureVertices) { h=VertexInput::hook(); vertexHookInstalled=h==0; }
+            j=NativeMeshBuild::hook(); meshBuildHook=j==0;
+            int k=MeshEnd::hook(); meshEndHook=k==0;
+            int l=MeshDrawOne::hook(); meshOneHook=l==0;
+            int m=MeshDrawMeta::hook(); meshMetaHook=m==0;
+            int n=MeshDrawSpan::hook(); meshSpanHook=n==0;
+            // -998 = SDK runtime symbol missing; do not install a hook at a guessed address.
+            int t=-998,u=-998;
+            if(textureItemSymbol.resolve(true)){t=TextureItemBuild::hook();textureItemHook=t==0;}
+            if(textureTessSymbol.resolve(true)){u=TextureTessBuild::hook();textureTessHook=u==0;}
             { std::lock_guard guard(fileMutex);
               output << "HOOK_STATUS first=" << a << " item=" << b << " default=" << c << '\n'
-                     << "HOOK_NOTE 0=success; -999=not_attempted\n"
+                     << "HOOK_NOTE 0=success; -999=not_attempted; -998=optional_symbol_missing\n"
                      << "HOOK_STATUS native_draw=" << d << " attach_entry=" << e << " attach_inner=" << f
-                     << " attach_draw=" << g << " vertex=" << h << " mesh_build=" << j << '\n' << std::flush; }
+                     << " attach_draw=" << g << " vertex=" << h << " mesh_build=" << j << '\n'
+                     << "HOOK_STATUS tess_end=" << k << " mesh_single=" << l << " mesh_metadata=" << m << " mesh_span=" << n << '\n'
+                     << "HOOK_STATUS texture_item=" << t << " texture_tessellate=" << u << '\n'
+                     << "capture_unscoped_meshes=" << captureUnscoped << '\n' << std::flush; }
             if (!defaultHook && !nativeDrawHook && !attachDrawHook) { self.getLogger().error("No matrix/draw hooks available"); disable(); return false; }
             active.store(true);
             self.getLogger().info("Item inspector enabled; output: {}", path.string());
@@ -435,6 +653,12 @@ public:
     bool disable() {
         active.store(false);
         // No file mutex held while unhooking. Never unhook from within render callbacks.
+        if (textureTessHook) { TextureTessBuild::unhook(); textureTessHook=false; }
+        if (textureItemHook) { TextureItemBuild::unhook(); textureItemHook=false; }
+        if (meshSpanHook) { MeshDrawSpan::unhook(); meshSpanHook=false; }
+        if (meshMetaHook) { MeshDrawMeta::unhook(); meshMetaHook=false; }
+        if (meshOneHook) { MeshDrawOne::unhook(); meshOneHook=false; }
+        if (meshEndHook) { MeshEnd::unhook(); meshEndHook=false; }
         if (meshBuildHook) { NativeMeshBuild::unhook(); meshBuildHook=false; }
         if (vertexHookInstalled) { VertexInput::unhook(); vertexHookInstalled=false; }
         if (attachDrawHook) { AttachDraw::unhook(); attachDrawHook=false; }
