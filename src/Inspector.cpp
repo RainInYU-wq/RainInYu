@@ -475,7 +475,7 @@ static void meshDrawRecord(char const* entry, mce::Mesh const& mesh, mce::MeshCo
 }
 using DrawTexture=std::variant<std::monostate,mce::TexturePtr,mce::ClientTexture,mce::ServerTexture>;
 using DrawFn=void (mce::Mesh::*)(mce::MeshContext&,mce::MaterialPtr const&,DrawTexture const&,uint,uint,OffscreenCaptureDescription const&,mce::IndexBufferContainer const*) const;
-using DrawMetaFn=void (mce::Mesh::*)(mce::MeshContext&,dragon::RenderMetadata const&,mce::MaterialPtr const&,DrawTexture const&,uint,uint,OffscreenCaptureDescription const&,mce::IndexBufferContainer const*) const;
+using DrawMetaFn=void (mce::Mesh::*)(mce::MeshContext&,dragon::RenderMetadata const&,mce::MaterialPtr const&,DrawTexture const&,uint,uint,mce::IndexBufferContainer const*) const;
 using DrawSpanFn=void (mce::Mesh::*)(mce::MeshContext&,mce::MaterialPtr const&,gsl::span<mce::ClientTexture const*>,uint,uint,OffscreenCaptureDescription const&,mce::IndexBufferContainer const*) const;
 LL_TYPE_INSTANCE_HOOK(MeshDrawOne,ll::memory::HookPriority::Normal,mce::Mesh,
     static_cast<DrawFn>(&mce::Mesh::renderMesh),void,
@@ -488,10 +488,10 @@ LL_TYPE_INSTANCE_HOOK(MeshDrawOne,ll::memory::HookPriority::Normal,mce::Mesh,
 LL_TYPE_INSTANCE_HOOK(MeshDrawMeta,ll::memory::HookPriority::Normal,mce::Mesh,
     static_cast<DrawMetaFn>(&mce::Mesh::renderMesh),void,
     mce::MeshContext& ctx,dragon::RenderMetadata const& meta,mce::MaterialPtr const& mat,DrawTexture const& tex,uint start,uint count,
-    OffscreenCaptureDescription const& off,mce::IndexBufferContainer const* idx){
+    mce::IndexBufferContainer const* idx){
     MeshDrawScope depth;
     try{meshDrawRecord("renderMesh_metadata",*this,ctx,start,count,idx!=nullptr);}catch(...){}
-    origin(ctx,meta,mat,tex,start,count,off,idx);
+    origin(ctx,meta,mat,tex,start,count,idx);
 }
 LL_TYPE_INSTANCE_HOOK(MeshDrawSpan,ll::memory::HookPriority::Normal,mce::Mesh,
     static_cast<DrawSpanFn>(&mce::Mesh::renderMesh),void,
@@ -608,7 +608,7 @@ public:
                 output.imbue(std::locale::classic());
                 output << std::setprecision(9);
                 started = Clock::now(); drawSequence=0; textureSequence=0; samples.clear(); observed.clear(); stages.clear(); total=0; stageTotal=0; limitReported=false;
-                output << "\n=== BE Item Transform Inspector 0.2.1-meshprobe1 | SDK 26.60.9 | new session ===\n"
+                output << "\n=== BE Item Transform Inspector 0.2.1-meshprobe1-hotfix1 | SDK 26.60.9 | new session ===\n"
                        << "capture_label=" << label << " target=" << captureTarget << '\n'
                        << "Raw stage observations only; CPU mesh is not shader input readback. Projection separate. No automatic landmark pairing or final common matrix asserted.\n"
                        << "flags: first=1 world=2 UI=4 item2d=8 item3d=16 inhand=32 glint=64 tint=128; -1 unknown\n"
